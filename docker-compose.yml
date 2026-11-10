@@ -1,0 +1,13 @@
+# IBM MQ Advanced for Developers (free for development use).
+# Creates queue manager QM1, channel DEV.APP.SVRCONN and queues DEV.QUEUE.1-3.
+services:
+  mq:
+    image: icr.io/ibm-messaging/mq:latest
+    ports:
+      - "1414:1414"   # MQ listener
+      - "9443:9443"   # MQ web console
+    environment:
+      LICENSE: accept
+      MQ_QMGR_NAME: QM1
+      MQ_APP_PASSWORD: ${MQ_PASSWORD}
+      MQ_ADMIN_PASSWORD: ${MQ_ADMIN_PASSWORD}

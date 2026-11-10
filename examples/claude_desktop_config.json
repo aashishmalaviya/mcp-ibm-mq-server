@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ibm-mq": {
+      "command": "mcp-ibm-mq-server",
+      "env": {
+        "MQ_FAKE": "true",
+        "MQ_READ_QUEUES": "ORDERS.STATUS",
+        "MQ_AGENT_ID": "claude-desktop"
+      }
+    }
+  }
+}
