@@ -22,7 +22,7 @@ class Message:
 class MQClient(Protocol):
     def depth(self, queue: str) -> int: ...
     def browse(self, queue: str, limit: int) -> list[Message]: ...
-    def put(self, queue: str, body: bytes, correl_id: str | None = None) -> str: ...
+    def put(self, queue: str, body: bytes, correl_id: str | None = None, trace_id: str | None = None) -> str: ...
     def get(self, queue: str) -> Message | None: ...
 
 
@@ -83,12 +83,15 @@ class PyMQIClient:
             q.close()
         return out
 
-    def put(self, queue: str, body: bytes, correl_id: str | None = None) -> str:
+    def put(self, queue: str, body: bytes, correl_id: str | None = None, trace_id: str | None = None) -> str:
         C = self.CMQC
         md = self.pymqi.MD()
         md.Format = C.MQFMT_STRING
         if correl_id:
             md.CorrelId = correl_id.encode("utf-8")[:24].ljust(24, b"\x00")
+        elif trace_id:
+            # 16-byte W3C trace ID in the 24-byte CorrelId; consumers read its first 32 hex characters.
+            md.CorrelId = bytes.fromhex(trace_id).ljust(24, b"\x00")
         q = self.pymqi.Queue(self._connect(), queue, C.MQOO_OUTPUT)
         try:
             q.put(body, md)
@@ -143,9 +146,9 @@ class InMemoryClient:
     def browse(self, queue: str, limit: int) -> list[Message]:
         return list(self.queues.get(queue, [])[:limit])
 
-    def put(self, queue: str, body: bytes, correl_id: str | None = None) -> str:
+    def put(self, queue: str, body: bytes, correl_id: str | None = None, trace_id: str | None = None) -> str:
         msg_id = self._next_id()
-        correl = (correl_id or "").encode().hex()
+        correl = (correl_id or "").encode().hex() if correl_id or not trace_id else trace_id
         self.queues.setdefault(queue, []).append(
             Message(body=body, msg_id=msg_id, correl_id=correl, put_time="20261109 120000")
         )

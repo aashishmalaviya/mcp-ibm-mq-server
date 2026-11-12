@@ -6,7 +6,13 @@
 
 Most AI agent demos connect straight to core systems with a service account. That never gets past security in a bank, a hospital or a government agency. This server puts a narrow, audited tool layer between the agent and IBM MQ, so Claude, Copilot, OpenAI or Gemini agents can work with existing queues while the queue manager, its channels and the core systems stay unchanged.
 
-It is the reference implementation for issue #1 of my newsletter, [*Integration to Intelligence*](https://www.linkedin.com/in/aashish-malaviya): *"Your AI agent shouldn't touch your core systems directly."*
+It is the reference implementation for my newsletter, [*Integration to Intelligence*](https://www.linkedin.com/in/aashish-malaviya):
+
+- Issue 1, *"Your AI agent shouldn't touch your core systems directly"*: the governed tool layer (v0.1.0)
+- Issue 2, *"Your AI agent needs a release gate, not a demo"*: the eval gate in CI (v0.2.0, [below](#release-gate))
+- Issue 3, *"Where the human belongs in an AI agent workflow"*: human approval for risky writes (v0.3.0, [below](#human-approval))
+- Issue 4, *"Your AI agent needs an identity, not a service account"*: agent identity, OAuth and per-tool scopes (v0.4.0, [below](#identity-oauth-and-least-privilege))
+- Issue 5, *"What did the agent actually do?"*: traces correlated across hops, and trace replay (v0.5.0, [below](#tracing-and-replay))
 
 ## Why this design
 
@@ -15,9 +21,12 @@ It is the reference implementation for issue #1 of my newsletter, [*Integration 
 | **Tools, not tables** | Agents get five business-level tools, never raw MQI access |
 | **Deny by default** | Only queues on an allow-list are visible; everything else is refused |
 | **Read-only by default** | Writes need `MQ_READ_ONLY=false` **and** the queue on the write list |
+| **People approve risky writes** | Puts to queues on `MQ_APPROVAL_QUEUES` wait for a named person; approvals are single-use, bound to the exact body, and expire |
 | **Consuming is a separate decision** | Destructive `get_message` needs a third switch, `MQ_ALLOW_DESTRUCTIVE_GET=true` |
 | **Bounded** | Message size limit and a cap on how many messages one browse returns |
 | **Auditable** | Every call, allowed or denied, is a JSON audit line; bodies are never logged, only their SHA-256 |
+| **Every call has a name** | Each call carries the agent and the user it acts for; access is the intersection of both, never the union |
+| **Every call is on a trace** | Each call joins the caller's W3C trace (or starts one); audit lines carry trace and span IDs, and the trace can travel into MQ |
 | **Model-agnostic** | Any MCP client: Claude Desktop, Claude Code, Copilot Studio, OpenAI Agents SDK, Gemini |
 
 ## Tools
@@ -29,6 +38,7 @@ It is the reference implementation for issue #1 of my newsletter, [*Integration 
 | `browse_messages` | Read up to N messages **without** removing them | read-only |
 | `put_message` | Send a text message (optional correlation ID) | write |
 | `get_message` | Consume the next message | destructive |
+| `approval_status` | Check whether a person approved a pending put | read-only |
 
 ## Quick start (no IBM MQ needed)
 
@@ -94,8 +104,18 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 | `MQ_ALLOW_DESTRUCTIVE_GET` | `false` | Allow `get_message` to consume |
 | `MQ_MAX_MESSAGE_BYTES` | `65536` | Largest message an agent may send |
 | `MQ_MAX_BROWSE` | `20` | Most messages one browse returns |
+| `MQ_APPROVAL_QUEUES` | *(none)* | Write queues where every put needs a person's approval |
+| `MQ_APPROVAL_TTL_SECONDS` | `3600` | How long a request (or an unused approval) stays valid |
+| `MQ_APPROVAL_STORE` | in memory | JSON file shared by the server and the approver CLI |
 | `MQ_AUDIT_LOG` | stderr | Path for JSON-lines audit log |
-| `MQ_AGENT_ID` | `unknown-agent` | Identity recorded in the audit log |
+| `MQ_AGENT_ID` | `unknown-agent` | The agent's identity (stdio) |
+| `MQ_AGENT_SCOPES` | all | The agent's grant (stdio): any of `mq.read`, `mq.write`, `mq.consume` |
+| `MQ_ON_BEHALF_OF` | *(none)* | The user the agent acts for (stdio) |
+| `MQ_ENTITLEMENTS` | *(none)* | JSON file of user scopes and queues; when set, every call must be for a known user |
+| `MQ_TRACE_TO_CORRELID` | `false` | Put the trace ID into a sent message's CorrelId when the agent gives no correlation ID |
+| `MQ_TRANSPORT` | `stdio` | `streamable-http` to serve over HTTP with OAuth |
+| `MQ_AUTH_ISSUER`, `MQ_AUTH_AUDIENCE`, `MQ_AUTH_JWKS_URL` | | OAuth issuer, this server's URL (token audience), signing keys (HTTP) |
+| `MQ_HTTP_HOST`, `MQ_HTTP_PORT` | `127.0.0.1`, `8000` | HTTP listener |
 | `MQ_QMGR`, `MQ_CONN_INFO`, `MQ_CHANNEL`, `MQ_USER`, `MQ_PASSWORD` | | Queue manager connection |
 | `MQ_FAKE` | `false` | Use the in-memory demo queue manager |
 
@@ -103,8 +123,8 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 
 - Run the server behind your **API gateway** (Apigee, Azure API Management, Kong, IBM API Connect) when exposing it over HTTP, so agents inherit OAuth identity, rate limits and logging. Use stdio for local clients.
 - Give the MQ user **least privilege** with `setmqaut` (browse/inq on read queues, put on write queues only) and enable **TLS** and **CHLAUTH** on the channel. The policy here is a second line of defence, not a replacement for MQ security.
-- Ship the audit log to your SIEM; correlate on `audit_id`, `msg_id` and `MQ_AGENT_ID`.
-- Keep a **human-in-the-loop** step for high-risk puts (payments, account changes) in the agent workflow.
+- Ship the audit log to your SIEM; correlate on `audit_id`, `msg_id`, `actor` (agent) and `on_behalf_of` (user).
+- Put high-risk queues (payments, account changes) on `MQ_APPROVAL_QUEUES` and keep the approval store on durable, access-controlled storage.
 
 ## Tests
 
@@ -114,11 +134,105 @@ pip install -e ".[dev]" && pytest
 
 Tests use the in-memory client, so they run anywhere, including CI.
 
+## Human approval
+
+For queues where a wrong message costs real money or harm (payments, account changes), the agent can propose a put but cannot send it on its own:
+
+1. The agent calls `put_message`. Nothing is sent. The server records a request and returns `status: approval_required` with an `approval_id`.
+2. A person reviews it outside the agent and decides, with their name and a reason:
+
+   ```bash
+   export MQ_APPROVAL_STORE=/var/lib/mcp-ibm-mq/approvals.json   # same file as the server
+   mcp-ibm-mq-approvals list
+   mcp-ibm-mq-approvals show apr_3f9c2a1b7d4e6f80
+   mcp-ibm-mq-approvals approve apr_3f9c2a1b7d4e6f80 --approver jane.doe --reason "Matches invoice 4411"
+   ```
+
+3. The agent calls `put_message` again with the same queue, the same body and the `approval_id`.
+
+The server only sends it if the request was approved, by someone other than the requesting agent, has not expired, matches the approved queue and body (SHA-256), and has not been used before. Expiry never turns into approval. The agent has no tool that can approve anything, and every request, decision and send is in the audit log.
+
+The CLI is the simplest approver; in production, point your own workflow tool (ServiceNow, a Teams approval, a case system) at the same store or replace `ApprovalStore` with one backed by it.
+
+## Identity, OAuth and least privilege
+
+No shared service account: every call is made by a named agent, usually on behalf of a named user, and both appear in the audit log (`actor`, `on_behalf_of`, `scope`).
+
+**Scopes per tool.** `mq.read` (list, depth, browse, approval status), `mq.write` (put), `mq.consume` (destructive get).
+
+**Intersection, never union.** A call must be allowed by the server policy, the agent's scopes, and, when `MQ_ENTITLEMENTS` is set, the user's scopes and queues:
+
+```json
+{
+  "users": {
+    "analyst.y": {"scopes": ["mq.read", "mq.write"], "read_queues": ["ORDERS.STATUS"], "write_queues": ["ORDERS.REQUEST"]},
+    "intern.z":  {"scopes": ["mq.read"], "read_queues": ["ORDERS.STATUS"]}
+  }
+}
+```
+
+With entitlements on, an agent acting for no one, or for an unknown user, gets nothing.
+
+**Over HTTP, identity comes from OAuth.** The server is an OAuth 2.1 resource server, as in the MCP authorization specification. Register each agent with your identity provider (Entra ID, Okta, Ping, Keycloak) and run:
+
+```bash
+pip install -e ".[auth]"
+export MQ_TRANSPORT=streamable-http
+export MQ_AUTH_ISSUER=https://login.example.com/tenant-1
+export MQ_AUTH_AUDIENCE=https://mq-mcp.example.com          # this server; tokens must name it
+export MQ_AUTH_JWKS_URL=https://login.example.com/tenant-1/keys
+mcp-ibm-mq-server
+```
+
+Each request's bearer token is verified (signature against the JWKS, issuer, audience, expiry; `none` and HMAC algorithms are refused). The agent is `azp` / `client_id`, or the actor in an RFC 8693 `act` claim after a token exchange; the user is `sub`; scopes come from `scope` / `scp`. Ask your identity provider for short-lived tokens, and exchange the user's token for one scoped to this server rather than forwarding it.
+
+## Tracing and replay
+
+When something goes wrong, the first question is what the agent actually did. Every tool call is a span on a trace:
+
+- **Joins the caller's trace.** A W3C `traceparent` in the MCP request's `_meta` or the HTTP headers is continued; without one, a new trace starts. A malformed or all-zero `traceparent` is ignored, never copied.
+- **Every audit line carries it:** `trace_id`, `span_id`, `parent_span_id` and `duration_ms`, next to the agent, the user, the scope and the policy decision. Refused calls are traced too.
+- **Travels into MQ.** With `MQ_TRACE_TO_CORRELID=true`, a message sent without its own correlation ID gets the 16-byte trace ID in its CorrelId, so the consuming application can log the same trace.
+- **Approvals stay on the trace.** The approval request and the human decision carry the trace ID of the call that asked.
+
+Replay a trace for an incident review:
+
+```bash
+mcp-ibm-mq-trace 4bf92f3577b34da6a3ce929d0e0e4736 --log /var/log/mcp-ibm-mq/audit.jsonl
+```
+
+```
+Trace 4bf92f3577b34da6a3ce929d0e0e4736: 3 event(s)
+2026-12-08T14:02:11.204Z  approval_required put_message PAYMENTS.OUT   payments-agent for analyst.y    0.4 ms  approval apr_3f9c2a1b7d4e6f80
+2026-12-08T14:05:40.019Z  approved          approval_decision PAYMENTS.OUT human:jane.doe
+2026-12-08T14:05:52.771Z  ok                put_message PAYMENTS.OUT   payments-agent for analyst.y    1.2 ms  approval apr_3f9c2a1b7d4e6f80
+```
+
+The audit log is JSON lines, so the same fields load straight into a SIEM or an OpenTelemetry pipeline.
+
+## Release gate
+
+Every pull request runs an eval gate (`.github/workflows/ci.yml`, job `eval-gate`). A change does not merge if any score drops below its floor in [`evals/thresholds.yaml`](evals/thresholds.yaml).
+
+| Layer | What it checks | Needs |
+| --- | --- | --- |
+| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 74 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, every audit line is on a trace, and 34 attack cases are refused: planted instructions, queue-name smuggling, admin queue, draining, forged or reused approvals, a body swapped after approval, self-approval, agent and user rights combined as a union, and tokens that are unsigned, forged, expired, for another server or issuer, or use algorithm confusion, and trace headers that are malformed, all-zero or oversized. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
+| Agent ([`run_agent_evals.py`](evals/run_agent_evals.py)) | Claude drives the tools for 10 prompts in [`agent_cases.yaml`](evals/agent_cases.yaml): right tool and queue, and no obeying instructions planted in message bodies | `ANTHROPIC_API_KEY` repository secret; skipped without it |
+
+Run it locally:
+
+```bash
+pip install -e ".[evals]"
+python evals/run_evals.py                              # deterministic gate
+ANTHROPIC_API_KEY=... python evals/run_agent_evals.py  # agent evals
+```
+
+The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only, approvals that skip the body check or never expire, agent-only scope checks, tokens accepted for any audience, unvalidated trace headers, untraced audit lines) and checks that the gate blocks it.
+
 ## Roadmap
 
-- Streamable HTTP transport with OAuth (MCP authorization spec)
+- OpenTelemetry span export alongside the audit log
 - JSON-schema validation of message bodies per queue
-- Approval hook for writes above a risk threshold
 - IBM MQ REST API client option (no native client libraries)
 
 ## About
