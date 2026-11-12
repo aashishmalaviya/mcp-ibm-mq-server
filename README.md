@@ -10,6 +10,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 
 - Issue 1, *"Your AI agent shouldn't touch your core systems directly"*: the governed tool layer (v0.1.0)
 - Issue 2, *"Your AI agent needs a release gate, not a demo"*: the eval gate in CI (v0.2.0, [below](#release-gate))
+- Issue 3, *"Where the human belongs in an AI agent workflow"*: human approval for risky writes (v0.3.0, [below](#human-approval))
 
 ## Why this design
 
@@ -18,6 +19,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 | **Tools, not tables** | Agents get five business-level tools, never raw MQI access |
 | **Deny by default** | Only queues on an allow-list are visible; everything else is refused |
 | **Read-only by default** | Writes need `MQ_READ_ONLY=false` **and** the queue on the write list |
+| **People approve risky writes** | Puts to queues on `MQ_APPROVAL_QUEUES` wait for a named person; approvals are single-use, bound to the exact body, and expire |
 | **Consuming is a separate decision** | Destructive `get_message` needs a third switch, `MQ_ALLOW_DESTRUCTIVE_GET=true` |
 | **Bounded** | Message size limit and a cap on how many messages one browse returns |
 | **Auditable** | Every call, allowed or denied, is a JSON audit line; bodies are never logged, only their SHA-256 |
@@ -32,6 +34,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 | `browse_messages` | Read up to N messages **without** removing them | read-only |
 | `put_message` | Send a text message (optional correlation ID) | write |
 | `get_message` | Consume the next message | destructive |
+| `approval_status` | Check whether a person approved a pending put | read-only |
 
 ## Quick start (no IBM MQ needed)
 
@@ -97,6 +100,9 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 | `MQ_ALLOW_DESTRUCTIVE_GET` | `false` | Allow `get_message` to consume |
 | `MQ_MAX_MESSAGE_BYTES` | `65536` | Largest message an agent may send |
 | `MQ_MAX_BROWSE` | `20` | Most messages one browse returns |
+| `MQ_APPROVAL_QUEUES` | *(none)* | Write queues where every put needs a person's approval |
+| `MQ_APPROVAL_TTL_SECONDS` | `3600` | How long a request (or an unused approval) stays valid |
+| `MQ_APPROVAL_STORE` | in memory | JSON file shared by the server and the approver CLI |
 | `MQ_AUDIT_LOG` | stderr | Path for JSON-lines audit log |
 | `MQ_AGENT_ID` | `unknown-agent` | Identity recorded in the audit log |
 | `MQ_QMGR`, `MQ_CONN_INFO`, `MQ_CHANNEL`, `MQ_USER`, `MQ_PASSWORD` | | Queue manager connection |
@@ -107,7 +113,7 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 - Run the server behind your **API gateway** (Apigee, Azure API Management, Kong, IBM API Connect) when exposing it over HTTP, so agents inherit OAuth identity, rate limits and logging. Use stdio for local clients.
 - Give the MQ user **least privilege** with `setmqaut` (browse/inq on read queues, put on write queues only) and enable **TLS** and **CHLAUTH** on the channel. The policy here is a second line of defence, not a replacement for MQ security.
 - Ship the audit log to your SIEM; correlate on `audit_id`, `msg_id` and `MQ_AGENT_ID`.
-- Keep a **human-in-the-loop** step for high-risk puts (payments, account changes) in the agent workflow.
+- Put high-risk queues (payments, account changes) on `MQ_APPROVAL_QUEUES` and keep the approval store on durable, access-controlled storage.
 
 ## Tests
 
@@ -117,13 +123,33 @@ pip install -e ".[dev]" && pytest
 
 Tests use the in-memory client, so they run anywhere, including CI.
 
+## Human approval
+
+For queues where a wrong message costs real money or harm (payments, account changes), the agent can propose a put but cannot send it on its own:
+
+1. The agent calls `put_message`. Nothing is sent. The server records a request and returns `status: approval_required` with an `approval_id`.
+2. A person reviews it outside the agent and decides, with their name and a reason:
+
+   ```bash
+   export MQ_APPROVAL_STORE=/var/lib/mcp-ibm-mq/approvals.json   # same file as the server
+   mcp-ibm-mq-approvals list
+   mcp-ibm-mq-approvals show apr_3f9c2a1b7d4e6f80
+   mcp-ibm-mq-approvals approve apr_3f9c2a1b7d4e6f80 --approver jane.doe --reason "Matches invoice 4411"
+   ```
+
+3. The agent calls `put_message` again with the same queue, the same body and the `approval_id`.
+
+The server only sends it if the request was approved, by someone other than the requesting agent, has not expired, matches the approved queue and body (SHA-256), and has not been used before. Expiry never turns into approval. The agent has no tool that can approve anything, and every request, decision and send is in the audit log.
+
+The CLI is the simplest approver; in production, point your own workflow tool (ServiceNow, a Teams approval, a case system) at the same store or replace `ApprovalStore` with one backed by it.
+
 ## Release gate
 
 Every pull request runs an eval gate (`.github/workflows/ci.yml`, job `eval-gate`). A change does not merge if any score drops below its floor in [`evals/thresholds.yaml`](evals/thresholds.yaml).
 
 | Layer | What it checks | Needs |
 | --- | --- | --- |
-| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 30 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, 12 attack cases (planted instructions, queue-name smuggling, case and whitespace tricks, admin queue, draining) are refused. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
+| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 44 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, 18 attack cases (planted instructions, queue-name smuggling, case and whitespace tricks, admin queue, draining, forged or reused approvals, a body swapped after approval, self-approval) are refused. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
 | Agent ([`run_agent_evals.py`](evals/run_agent_evals.py)) | Claude drives the tools for 10 prompts in [`agent_cases.yaml`](evals/agent_cases.yaml): right tool and queue, and no obeying instructions planted in message bodies | `ANTHROPIC_API_KEY` repository secret; skipped without it |
 
 Run it locally:
@@ -134,13 +160,12 @@ python evals/run_evals.py                              # deterministic gate
 ANTHROPIC_API_KEY=... python evals/run_agent_evals.py  # agent evals
 ```
 
-The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only) and checks that the gate blocks it.
+The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only, approvals that skip the body check or never expire) and checks that the gate blocks it.
 
 ## Roadmap
 
 - Streamable HTTP transport with OAuth (MCP authorization spec)
 - JSON-schema validation of message bodies per queue
-- Approval hook for writes above a risk threshold (newsletter issue 3: where the human belongs)
 - IBM MQ REST API client option (no native client libraries)
 
 ## About

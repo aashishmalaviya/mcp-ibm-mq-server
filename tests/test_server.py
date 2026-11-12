@@ -11,4 +11,6 @@ def test_tools_are_registered():
     svc = MQService(InMemoryClient(), Policy(), AuditLog(path="/dev/null"))
     server = create_server(svc)
     names = {t.name for t in asyncio.run(server.list_tools())}
-    assert names == {"list_queues", "queue_depth", "browse_messages", "put_message", "get_message"}
+    assert names == {
+        "list_queues", "queue_depth", "browse_messages", "put_message", "get_message", "approval_status",
+    }
