@@ -36,6 +36,8 @@ class Policy:
     allow_destructive_get: bool = False
     max_message_bytes: int = 64 * 1024
     max_browse: int = 20
+    approval_queues: frozenset[str] = field(default_factory=frozenset)
+    approval_ttl_seconds: int = 3600
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Policy":
@@ -47,6 +49,8 @@ class Policy:
             allow_destructive_get=_flag(env.get("MQ_ALLOW_DESTRUCTIVE_GET"), False),
             max_message_bytes=int(env.get("MQ_MAX_MESSAGE_BYTES") or 64 * 1024),
             max_browse=int(env.get("MQ_MAX_BROWSE") or 20),
+            approval_queues=_split(env.get("MQ_APPROVAL_QUEUES")),
+            approval_ttl_seconds=int(env.get("MQ_APPROVAL_TTL_SECONDS") or 3600),
         )
 
     # -- checks -----------------------------------------------------------
@@ -75,6 +79,9 @@ class Policy:
                 "Destructive get is disabled; use browse_messages, or set "
                 "MQ_READ_ONLY=false and MQ_ALLOW_DESTRUCTIVE_GET=true."
             )
+
+    def needs_approval(self, queue: str) -> bool:
+        return queue in self.approval_queues
 
     def clamp_browse(self, requested: int) -> int:
         return max(1, min(int(requested), self.max_browse))
