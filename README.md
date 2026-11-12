@@ -12,6 +12,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 - Issue 2, *"Your AI agent needs a release gate, not a demo"*: the eval gate in CI (v0.2.0, [below](#release-gate))
 - Issue 3, *"Where the human belongs in an AI agent workflow"*: human approval for risky writes (v0.3.0, [below](#human-approval))
 - Issue 4, *"Your AI agent needs an identity, not a service account"*: agent identity, OAuth and per-tool scopes (v0.4.0, [below](#identity-oauth-and-least-privilege))
+- Issue 5, *"What did the agent actually do?"*: traces correlated across hops, and trace replay (v0.5.0, [below](#tracing-and-replay))
 
 ## Why this design
 
@@ -25,6 +26,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 | **Bounded** | Message size limit and a cap on how many messages one browse returns |
 | **Auditable** | Every call, allowed or denied, is a JSON audit line; bodies are never logged, only their SHA-256 |
 | **Every call has a name** | Each call carries the agent and the user it acts for; access is the intersection of both, never the union |
+| **Every call is on a trace** | Each call joins the caller's W3C trace (or starts one); audit lines carry trace and span IDs, and the trace can travel into MQ |
 | **Model-agnostic** | Any MCP client: Claude Desktop, Claude Code, Copilot Studio, OpenAI Agents SDK, Gemini |
 
 ## Tools
@@ -110,6 +112,7 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 | `MQ_AGENT_SCOPES` | all | The agent's grant (stdio): any of `mq.read`, `mq.write`, `mq.consume` |
 | `MQ_ON_BEHALF_OF` | *(none)* | The user the agent acts for (stdio) |
 | `MQ_ENTITLEMENTS` | *(none)* | JSON file of user scopes and queues; when set, every call must be for a known user |
+| `MQ_TRACE_TO_CORRELID` | `false` | Put the trace ID into a sent message's CorrelId when the agent gives no correlation ID |
 | `MQ_TRANSPORT` | `stdio` | `streamable-http` to serve over HTTP with OAuth |
 | `MQ_AUTH_ISSUER`, `MQ_AUTH_AUDIENCE`, `MQ_AUTH_JWKS_URL` | | OAuth issuer, this server's URL (token audience), signing keys (HTTP) |
 | `MQ_HTTP_HOST`, `MQ_HTTP_PORT` | `127.0.0.1`, `8000` | HTTP listener |
@@ -183,13 +186,37 @@ mcp-ibm-mq-server
 
 Each request's bearer token is verified (signature against the JWKS, issuer, audience, expiry; `none` and HMAC algorithms are refused). The agent is `azp` / `client_id`, or the actor in an RFC 8693 `act` claim after a token exchange; the user is `sub`; scopes come from `scope` / `scp`. Ask your identity provider for short-lived tokens, and exchange the user's token for one scoped to this server rather than forwarding it.
 
+## Tracing and replay
+
+When something goes wrong, the first question is what the agent actually did. Every tool call is a span on a trace:
+
+- **Joins the caller's trace.** A W3C `traceparent` in the MCP request's `_meta` or the HTTP headers is continued; without one, a new trace starts. A malformed or all-zero `traceparent` is ignored, never copied.
+- **Every audit line carries it:** `trace_id`, `span_id`, `parent_span_id` and `duration_ms`, next to the agent, the user, the scope and the policy decision. Refused calls are traced too.
+- **Travels into MQ.** With `MQ_TRACE_TO_CORRELID=true`, a message sent without its own correlation ID gets the 16-byte trace ID in its CorrelId, so the consuming application can log the same trace.
+- **Approvals stay on the trace.** The approval request and the human decision carry the trace ID of the call that asked.
+
+Replay a trace for an incident review:
+
+```bash
+mcp-ibm-mq-trace 4bf92f3577b34da6a3ce929d0e0e4736 --log /var/log/mcp-ibm-mq/audit.jsonl
+```
+
+```
+Trace 4bf92f3577b34da6a3ce929d0e0e4736: 3 event(s)
+2026-12-08T14:02:11.204Z  approval_required put_message PAYMENTS.OUT   payments-agent for analyst.y    0.4 ms  approval apr_3f9c2a1b7d4e6f80
+2026-12-08T14:05:40.019Z  approved          approval_decision PAYMENTS.OUT human:jane.doe
+2026-12-08T14:05:52.771Z  ok                put_message PAYMENTS.OUT   payments-agent for analyst.y    1.2 ms  approval apr_3f9c2a1b7d4e6f80
+```
+
+The audit log is JSON lines, so the same fields load straight into a SIEM or an OpenTelemetry pipeline.
+
 ## Release gate
 
 Every pull request runs an eval gate (`.github/workflows/ci.yml`, job `eval-gate`). A change does not merge if any score drops below its floor in [`evals/thresholds.yaml`](evals/thresholds.yaml).
 
 | Layer | What it checks | Needs |
 | --- | --- | --- |
-| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 65 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, and 31 attack cases are refused: planted instructions, queue-name smuggling, admin queue, draining, forged or reused approvals, a body swapped after approval, self-approval, agent and user rights combined as a union, and tokens that are unsigned, forged, expired, for another server or issuer, or use algorithm confusion. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
+| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 74 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, every audit line is on a trace, and 34 attack cases are refused: planted instructions, queue-name smuggling, admin queue, draining, forged or reused approvals, a body swapped after approval, self-approval, agent and user rights combined as a union, and tokens that are unsigned, forged, expired, for another server or issuer, or use algorithm confusion, and trace headers that are malformed, all-zero or oversized. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
 | Agent ([`run_agent_evals.py`](evals/run_agent_evals.py)) | Claude drives the tools for 10 prompts in [`agent_cases.yaml`](evals/agent_cases.yaml): right tool and queue, and no obeying instructions planted in message bodies | `ANTHROPIC_API_KEY` repository secret; skipped without it |
 
 Run it locally:
@@ -200,11 +227,11 @@ python evals/run_evals.py                              # deterministic gate
 ANTHROPIC_API_KEY=... python evals/run_agent_evals.py  # agent evals
 ```
 
-The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only, approvals that skip the body check or never expire, agent-only scope checks, tokens accepted for any audience) and checks that the gate blocks it.
+The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only, approvals that skip the body check or never expire, agent-only scope checks, tokens accepted for any audience, unvalidated trace headers, untraced audit lines) and checks that the gate blocks it.
 
 ## Roadmap
 
-- Traces for every agent call, correlated across hops (newsletter issue 5)
+- OpenTelemetry span export alongside the audit log
 - JSON-schema validation of message bodies per queue
 - IBM MQ REST API client option (no native client libraries)
 

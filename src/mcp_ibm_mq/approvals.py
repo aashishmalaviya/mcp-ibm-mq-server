@@ -72,7 +72,7 @@ class ApprovalStore:
     # -- operations --------------------------------------------------------
 
     def create(self, *, queue: str, sha256: str, size: int, requested_by: str,
-               on_behalf_of: str | None, ttl_seconds: int) -> dict[str, Any]:
+               on_behalf_of: str | None, ttl_seconds: int, trace_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             data = self._load()
             now = self.clock()
@@ -87,6 +87,7 @@ class ApprovalStore:
                 "created_at": now,
                 "expires_at": now + ttl_seconds,
                 "status": PENDING,
+                "trace_id": trace_id,
             }
             data[req["id"]] = req
             self._save(data)

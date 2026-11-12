@@ -15,6 +15,11 @@ import uuid
 from typing import Any, TextIO
 
 
+def _now() -> str:
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t % 1 * 1000):03d}Z"
+
+
 class AuditLog:
     def __init__(self, path: str | None = None, stream: TextIO | None = None):
         self.path = path if path is not None else os.environ.get("MQ_AUDIT_LOG")
@@ -27,7 +32,7 @@ class AuditLog:
 
     def record(self, tool: str, outcome: str, actor: str | None = None, **fields: Any) -> dict[str, Any]:
         entry = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ts": _now(),
             "audit_id": uuid.uuid4().hex,
             "actor": actor or self.actor,
             "tool": tool,

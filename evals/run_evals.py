@@ -28,6 +28,7 @@ from mcp_ibm_mq.identity import Entitlements, Identity, parse_scopes
 from mcp_ibm_mq.mq_client import InMemoryClient
 from mcp_ibm_mq.policy import Policy
 from mcp_ibm_mq.service import MQService
+from mcp_ibm_mq.tracing import incoming_traceparent
 
 HERE = Path(__file__).resolve().parent
 TOOLS = {"list_queues", "queue_depth", "browse_messages", "put_message", "get_message", "approval_status"}
@@ -57,6 +58,7 @@ def build(profile: dict[str, Any], seed: dict[str, list[str]]):
         max_browse=int(profile.get("max_browse", 20)),
         approval_queues=frozenset(profile.get("approval_queues", [])),
         approval_ttl_seconds=int(profile.get("approval_ttl_seconds", 3600)),
+        trace_to_correlid=bool(profile.get("trace_to_correlid", False)),
     )
     queues = {q: [m.encode("utf-8") for m in (msgs or [])] for q, msgs in seed.items()}
     stream = io.StringIO()
@@ -164,7 +166,11 @@ def run() -> dict[str, Any]:
         saved, step_problems = run_steps(service, case)
         offset = len(stream.getvalue())
         before = depths(service, queues)
-        result = getattr(service, case["tool"])(**expand(case.get("args", {}), saved))
+        token = incoming_traceparent.set(expand({"tp": case.get("traceparent")})["tp"])
+        try:
+            result = getattr(service, case["tool"])(**expand(case.get("args", {}), saved))
+        finally:
+            incoming_traceparent.reset(token)
         after = depths(service, queues)
         full_log = stream.getvalue()
         log = full_log[offset:]
@@ -174,7 +180,23 @@ def run() -> dict[str, Any]:
         leaked = [m for m in markers if m in full_log]
         side_effect = (result.get("ok") is False) and before != after
 
+        lines = [json.loads(line) for line in log.splitlines()]
+        traced = bool(lines) and all(e.get("trace_id") and e.get("span_id") for e in lines)
+        for queue, want in (case.get("expect", {}).get("correl_after") or {}).items():
+            msgs = service.client.browse(queue, 1000)
+            got = msgs[-1].correl_id if msgs else None
+            if got != want:
+                problems.append(f"{queue} last CorrelId {got!r} expected {want!r}")
+        for text in case.get("expect", {}).get("audit_lacks") or []:
+            if text in log:
+                problems.append(f"audit log contains {text!r}")
+        for field in case.get("expect", {}).get("audit_present") or []:
+            if not (lines and lines[-1].get(field) not in (None, "")):
+                problems.append(f"audit line missing {field}")
         bump(case["category"], not problems)
+        bump("trace_coverage", traced)
+        if not traced:
+            problems.append("audit line without trace_id/span_id")
         bump("audit_coverage", audited)
         bump("no_leakage", not leaked)
         if result.get("ok") is False:

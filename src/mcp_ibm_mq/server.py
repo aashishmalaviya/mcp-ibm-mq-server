@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from .approvals import ApprovalStore
@@ -18,6 +18,16 @@ from .identity import Entitlements, Identity
 from .mq_client import InMemoryClient, PyMQIClient
 from .policy import Policy
 from .service import MQService
+from .tracing import incoming_traceparent, traceparent_from_context
+
+
+def _traced(ctx: Context | None, call):
+    """Run one tool call inside the caller's trace (traceparent from _meta or HTTP headers)."""
+    token = incoming_traceparent.set(traceparent_from_context(ctx) if ctx is not None else None)
+    try:
+        return call()
+    finally:
+        incoming_traceparent.reset(token)
 
 
 def build_service(identity=None) -> MQService:
@@ -72,23 +82,24 @@ def create_server(service: MQService | None = None, *, token_verifier=None, auth
     consume = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
     @mcp.tool(annotations=read)
-    def list_queues() -> dict:
+    def list_queues(ctx: Context | None = None) -> dict:
         """List the IBM MQ queues this agent is allowed to read or write."""
-        return svc.list_queues()
+        return _traced(ctx, svc.list_queues)
 
     @mcp.tool(annotations=read)
-    def queue_depth(queue: str) -> dict:
+    def queue_depth(queue: str, ctx: Context | None = None) -> dict:
         """Return the current number of messages on an allowed queue."""
-        return svc.queue_depth(queue)
+        return _traced(ctx, lambda: svc.queue_depth(queue))
 
     @mcp.tool(annotations=read)
-    def browse_messages(queue: str, max_messages: int = 5) -> dict:
+    def browse_messages(queue: str, max_messages: int = 5, ctx: Context | None = None) -> dict:
         """Read messages without removing them (non-destructive browse)."""
-        return svc.browse_messages(queue, max_messages)
+        return _traced(ctx, lambda: svc.browse_messages(queue, max_messages))
 
     @mcp.tool(annotations=write)
     def put_message(
-        queue: str, body: str, correl_id: str | None = None, approval_id: str | None = None
+        queue: str, body: str, correl_id: str | None = None, approval_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         """Send a text message to a write-allowed queue. Disabled when read-only.
 
@@ -97,17 +108,17 @@ def create_server(service: MQService | None = None, *, token_verifier=None, auth
         person approves, call again with the same queue, the same body and that
         approval_id. You cannot approve requests yourself.
         """
-        return svc.put_message(queue, body, correl_id, approval_id)
+        return _traced(ctx, lambda: svc.put_message(queue, body, correl_id, approval_id))
 
     @mcp.tool(annotations=read)
-    def approval_status(approval_id: str) -> dict:
+    def approval_status(approval_id: str, ctx: Context | None = None) -> dict:
         """Check whether a person has approved, rejected or let expire an approval request."""
-        return svc.approval_status(approval_id)
+        return _traced(ctx, lambda: svc.approval_status(approval_id))
 
     @mcp.tool(annotations=consume)
-    def get_message(queue: str) -> dict:
+    def get_message(queue: str, ctx: Context | None = None) -> dict:
         """Consume (remove) the next message. Disabled unless explicitly enabled."""
-        return svc.get_message(queue)
+        return _traced(ctx, lambda: svc.get_message(queue))
 
     return mcp
 

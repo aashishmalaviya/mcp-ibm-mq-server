@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-ibm-mq-server"
-version = "0.4.0"
+version = "0.5.0"
 description = "Governed Model Context Protocol (MCP) server that lets AI agents read and send IBM MQ messages safely."
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,6 +21,7 @@ evals = ["pyyaml>=6", "anthropic>=0.40", "pyjwt[crypto]>=2.8"]
 [project.scripts]
 mcp-ibm-mq-server = "mcp_ibm_mq.server:main"
 mcp-ibm-mq-approvals = "mcp_ibm_mq.approve_cli:main"
+mcp-ibm-mq-trace = "mcp_ibm_mq.trace_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_ibm_mq"]

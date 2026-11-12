@@ -38,6 +38,7 @@ class Policy:
     max_browse: int = 20
     approval_queues: frozenset[str] = field(default_factory=frozenset)
     approval_ttl_seconds: int = 3600
+    trace_to_correlid: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Policy":
@@ -51,6 +52,7 @@ class Policy:
             max_browse=int(env.get("MQ_MAX_BROWSE") or 20),
             approval_queues=_split(env.get("MQ_APPROVAL_QUEUES")),
             approval_ttl_seconds=int(env.get("MQ_APPROVAL_TTL_SECONDS") or 3600),
+            trace_to_correlid=_flag(env.get("MQ_TRACE_TO_CORRELID"), False),
         )
 
     # -- checks -----------------------------------------------------------

@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     audit = AuditLog()
     audit.actor = f"human:{args.approver}"
     audit.record("approval_decision", req["status"], approval_id=req["id"], queue=req["queue"],
-                 requested_by=req["requested_by"], reason=req["reason"])
+                 requested_by=req["requested_by"], reason=req["reason"], trace_id=req.get("trace_id"))
     print(f"{req['id']} {req['status']} by {req['decided_by']}.")
     return 0
 

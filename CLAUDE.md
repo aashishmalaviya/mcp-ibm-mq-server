@@ -8,7 +8,7 @@ A governed MCP server that lets AI agents work with IBM MQ without bypassing ent
 
 ## Layout
 
-- `src/mcp_ibm_mq/`: `server.py` (MCP wiring), `service.py` (tool logic), `policy.py` (deny-by-default rules), `audit.py` (JSON audit lines, payload digests only), `mq_client.py` (pymqi client and in-memory fake). Later releases add `approvals.py` and `approve_cli.py` (v0.3.0) and `identity.py` and `auth.py` (v0.4.0).
+- `src/mcp_ibm_mq/`: `server.py` (MCP wiring), `service.py` (tool logic), `policy.py` (deny-by-default rules), `audit.py` (JSON audit lines, payload digests only), `mq_client.py` (pymqi client and in-memory fake). Later releases add `approvals.py` and `approve_cli.py` (v0.3.0) `identity.py` and `auth.py` (v0.4.0), and `tracing.py` and `trace_cli.py` (v0.5.0).
 - `evals/`: the release gate. `cases.yaml` (deterministic cases), `run_evals.py`, `agent_cases.yaml` and `run_agent_evals.py` (Claude drives the tools; needs `ANTHROPIC_API_KEY`), `thresholds.yaml` (score floors).
 - `tests/`: pytest, all against the in-memory client. `tests/test_evals.py` weakens the code on purpose and asserts the gate blocks it.
 
@@ -23,7 +23,7 @@ PYTHONPATH=src python evals/run_evals.py    # must end with "Gate: **open**"
 ## Rules for changes
 
 - Security behaviour changes need eval cases in `evals/cases.yaml`, and ideally a gate test in `tests/test_evals.py` showing a plausible bug is caught. Deterministic floors are 100%; do not lower them to make a change pass.
-- Deny by default. New tools need a policy check, an audit line on every outcome (ok and denied), and no message bodies in the audit log.
+- Deny by default. New tools need a policy check, an audit line on every outcome (ok and denied), and no message bodies in the audit log. Every audit line must carry `trace_id` and `span_id` (start with `_begin`, record with `_record`).
 - Keep stdio defaults backward compatible; new controls are opt-in through environment variables documented in the README Configuration table.
 - Update `CHANGELOG.md` and the README with each release; bump `version` in `pyproject.toml`.
 - Use the REST API (`gh api`) for PRs and releases; GraphQL is not available in Claude sessions.
@@ -43,4 +43,4 @@ One release per newsletter issue, published the morning the article goes out (07
 | v0.2.0 | Eval release gate in CI | 2: "Your AI agent needs a release gate, not a demo" | Tue Nov 17, 2026 |
 | v0.3.0 | Human approval for risky writes | 3: "Where the human belongs in an AI agent workflow" | Tue Nov 24, 2026 |
 | v0.4.0 | Agent identity, OAuth, per-tool scopes | 4: "Your AI agent needs an identity, not a service account" | Tue Dec 1, 2026 |
-| next | Traces correlated across hops | 5: tracing and audit for agents | Tue Dec 8, 2026 (planned) |
+| v0.5.0 | Traces correlated across hops, trace replay | 5: "What did the agent actually do?" | Tue Dec 8, 2026 |

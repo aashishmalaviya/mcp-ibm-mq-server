@@ -14,6 +14,8 @@
 # result field), human decisions ("human: approve|reject"), and clock moves
 # ("advance_seconds"). The case's own tool call is the one that is scored.
 #
+# A case may set "traceparent" (W3C Trace Context) for its scored call.
+#
 # token_cases check OAuth access-token verification (auth.py) directly.
 
 profiles:
@@ -82,6 +84,12 @@ profiles:
     entitlements:
       users:
         analyst.y: {scopes: [mq.read], read_queues: [ORDERS.STATUS]}
+
+  tracing_correl:
+    read_queues: [ORDERS.STATUS]
+    write_queues: [ORDERS.REQUEST]
+    read_only: false
+    trace_to_correlid: true
 
 # OAuth settings for token cases: the runner signs test tokens with a key it
 # publishes in a JWKS, and with an attacker key it does not publish.
@@ -462,6 +470,71 @@ cases:
     tool: get_message
     args: {queue: ORDERS.STATUS}
     expect: {ok: false, error_contains: lacks scope, depth_after: {ORDERS.STATUS: 2}}
+
+  # ------------------------------------------------------- tracing (v0.5.0)
+  - id: F16-joins-callers-trace
+    category: functional
+    profile: read_only
+    traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    tool: queue_depth
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: true, audit_has: {trace_id: 4bf92f3577b34da6a3ce929d0e0e4736, parent_span_id: 00f067aa0ba902b7}, audit_present: [span_id, duration_ms]}
+  - id: F17-starts-trace-when-none-given
+    category: functional
+    profile: read_only
+    tool: browse_messages
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: true, audit_has: {parent_span_id: null}, audit_present: [trace_id, span_id, duration_ms]}
+  - id: F18-trace-id-travels-in-correlid
+    category: functional
+    profile: tracing_correl
+    traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: '{"orderId": "A-2001"}'}
+    expect: {ok: true, field_equals: {trace_id: 4bf92f3577b34da6a3ce929d0e0e4736}, correl_after: {ORDERS.REQUEST: 4bf92f3577b34da6a3ce929d0e0e4736}, audit_has: {correl_from_trace: true}}
+  - id: F19-explicit-correlid-wins
+    category: functional
+    profile: tracing_correl
+    traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: '{"orderId": "A-2002"}', correl_id: REQ-77}
+    expect: {ok: true, correl_after: {ORDERS.REQUEST: "5245512d3737"}, audit_has: {correl_from_trace: false}}
+  - id: F20-correlid-untouched-by-default
+    category: functional
+    profile: write_enabled
+    traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: '{"orderId": "A-2003"}'}
+    expect: {ok: true, correl_after: {ORDERS.REQUEST: ""}}
+  - id: P17-refusals-are-traced-too
+    category: policy
+    profile: read_only
+    traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    tool: browse_messages
+    args: {queue: PAYMENTS.OUT}
+    expect: {ok: false, field_equals: {trace_id: 4bf92f3577b34da6a3ce929d0e0e4736}, audit_has: {outcome: denied, trace_id: 4bf92f3577b34da6a3ce929d0e0e4736}}
+  - id: A22-malformed-traceparent-is-not-trusted
+    category: attack
+    note: Injected text in the trace header must not reach the log or the queue.
+    profile: tracing_correl
+    traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"; DROP TABLE audit; --'
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: '{"orderId": "A-2004"}'}
+    expect: {ok: true, audit_has: {parent_span_id: null}, audit_lacks: [DROP TABLE, 4bf92f3577b34da6a3ce929d0e0e4736]}
+  - id: A23-all-zero-trace-id-is-invalid
+    category: attack
+    profile: read_only
+    traceparent: 00-00000000000000000000000000000000-00f067aa0ba902b7-01
+    tool: queue_depth
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: true, audit_has: {parent_span_id: null}, audit_lacks: ["00000000000000000000000000000000"]}
+  - id: A24-oversized-traceparent
+    category: attack
+    profile: read_only
+    traceparent: {repeat: "a", times: 100000}
+    tool: queue_depth
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: true, audit_has: {parent_span_id: null}, audit_lacks: [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]}
 
 token_cases:
   - id: T01-valid-delegated-token

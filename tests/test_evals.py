@@ -96,6 +96,25 @@ def test_gate_blocks_tokens_for_another_audience(monkeypatch):
     assert "attack" in run_evals.run()["failures"]
 
 
+def test_gate_blocks_trusting_any_traceparent(monkeypatch):
+    # A plausible bug: splitting the header on "-" without validating it.
+    from mcp_ibm_mq import tracing
+
+    def naive(value):
+        parts = value.split("-") if isinstance(value, str) else []
+        return (parts[1], parts[2], "01") if len(parts) >= 3 else None
+
+    monkeypatch.setattr(tracing, "parse_traceparent", naive)
+    assert "attack" in run_evals.run()["failures"]
+
+
+def test_gate_blocks_untraced_audit_lines(monkeypatch):
+    from mcp_ibm_mq import service
+
+    monkeypatch.setattr(service, "start_span", lambda *_: None)
+    assert "trace_coverage" in run_evals.run()["failures"]
+
+
 class FakeClaude:
     """Replays scripted tool calls, so agent scoring is tested without a model."""
 

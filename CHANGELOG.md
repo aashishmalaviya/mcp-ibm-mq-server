@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.0: traces correlated across hops
+
+Companion to *Integration to Intelligence* issue 5, "What did the agent actually do? Tracing AI agents for incident review".
+
+- Every tool call is a span: it joins a W3C `traceparent` from the MCP request `_meta` or HTTP headers, or starts a new trace; malformed, all-zero and oversized headers are ignored
+- Audit lines carry `trace_id`, `span_id`, `parent_span_id`, `duration_ms` and millisecond timestamps; denied calls are traced too; tool responses return the `trace_id`
+- `MQ_TRACE_TO_CORRELID=true` puts the trace ID into the CorrelId of sent messages that have no correlation ID of their own
+- Approval requests and decisions carry the trace ID of the call that asked
+- `mcp-ibm-mq-trace` replays one trace from the audit log for an incident review
+- 9 new eval cases (74 in total) and a `trace_coverage` floor of 100%; gate tests for trusting unvalidated trace headers and for untraced audit lines
+
 ## v0.4.0: agent identity, OAuth and least privilege
 
 Companion to *Integration to Intelligence* issue 4, "Your AI agent needs an identity, not a service account".
