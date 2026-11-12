@@ -11,6 +11,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 - Issue 1, *"Your AI agent shouldn't touch your core systems directly"*: the governed tool layer (v0.1.0)
 - Issue 2, *"Your AI agent needs a release gate, not a demo"*: the eval gate in CI (v0.2.0, [below](#release-gate))
 - Issue 3, *"Where the human belongs in an AI agent workflow"*: human approval for risky writes (v0.3.0, [below](#human-approval))
+- Issue 4, *"Your AI agent needs an identity, not a service account"*: agent identity, OAuth and per-tool scopes (v0.4.0, [below](#identity-oauth-and-least-privilege))
 
 ## Why this design
 
@@ -23,6 +24,7 @@ It is the reference implementation for my newsletter, [*Integration to Intellige
 | **Consuming is a separate decision** | Destructive `get_message` needs a third switch, `MQ_ALLOW_DESTRUCTIVE_GET=true` |
 | **Bounded** | Message size limit and a cap on how many messages one browse returns |
 | **Auditable** | Every call, allowed or denied, is a JSON audit line; bodies are never logged, only their SHA-256 |
+| **Every call has a name** | Each call carries the agent and the user it acts for; access is the intersection of both, never the union |
 | **Model-agnostic** | Any MCP client: Claude Desktop, Claude Code, Copilot Studio, OpenAI Agents SDK, Gemini |
 
 ## Tools
@@ -104,7 +106,13 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 | `MQ_APPROVAL_TTL_SECONDS` | `3600` | How long a request (or an unused approval) stays valid |
 | `MQ_APPROVAL_STORE` | in memory | JSON file shared by the server and the approver CLI |
 | `MQ_AUDIT_LOG` | stderr | Path for JSON-lines audit log |
-| `MQ_AGENT_ID` | `unknown-agent` | Identity recorded in the audit log |
+| `MQ_AGENT_ID` | `unknown-agent` | The agent's identity (stdio) |
+| `MQ_AGENT_SCOPES` | all | The agent's grant (stdio): any of `mq.read`, `mq.write`, `mq.consume` |
+| `MQ_ON_BEHALF_OF` | *(none)* | The user the agent acts for (stdio) |
+| `MQ_ENTITLEMENTS` | *(none)* | JSON file of user scopes and queues; when set, every call must be for a known user |
+| `MQ_TRANSPORT` | `stdio` | `streamable-http` to serve over HTTP with OAuth |
+| `MQ_AUTH_ISSUER`, `MQ_AUTH_AUDIENCE`, `MQ_AUTH_JWKS_URL` | | OAuth issuer, this server's URL (token audience), signing keys (HTTP) |
+| `MQ_HTTP_HOST`, `MQ_HTTP_PORT` | `127.0.0.1`, `8000` | HTTP listener |
 | `MQ_QMGR`, `MQ_CONN_INFO`, `MQ_CHANNEL`, `MQ_USER`, `MQ_PASSWORD` | | Queue manager connection |
 | `MQ_FAKE` | `false` | Use the in-memory demo queue manager |
 
@@ -112,7 +120,7 @@ Then ask: *"What's on the ORDERS.STATUS queue?"*
 
 - Run the server behind your **API gateway** (Apigee, Azure API Management, Kong, IBM API Connect) when exposing it over HTTP, so agents inherit OAuth identity, rate limits and logging. Use stdio for local clients.
 - Give the MQ user **least privilege** with `setmqaut` (browse/inq on read queues, put on write queues only) and enable **TLS** and **CHLAUTH** on the channel. The policy here is a second line of defence, not a replacement for MQ security.
-- Ship the audit log to your SIEM; correlate on `audit_id`, `msg_id` and `MQ_AGENT_ID`.
+- Ship the audit log to your SIEM; correlate on `audit_id`, `msg_id`, `actor` (agent) and `on_behalf_of` (user).
 - Put high-risk queues (payments, account changes) on `MQ_APPROVAL_QUEUES` and keep the approval store on durable, access-controlled storage.
 
 ## Tests
@@ -143,13 +151,45 @@ The server only sends it if the request was approved, by someone other than the 
 
 The CLI is the simplest approver; in production, point your own workflow tool (ServiceNow, a Teams approval, a case system) at the same store or replace `ApprovalStore` with one backed by it.
 
+## Identity, OAuth and least privilege
+
+No shared service account: every call is made by a named agent, usually on behalf of a named user, and both appear in the audit log (`actor`, `on_behalf_of`, `scope`).
+
+**Scopes per tool.** `mq.read` (list, depth, browse, approval status), `mq.write` (put), `mq.consume` (destructive get).
+
+**Intersection, never union.** A call must be allowed by the server policy, the agent's scopes, and, when `MQ_ENTITLEMENTS` is set, the user's scopes and queues:
+
+```json
+{
+  "users": {
+    "analyst.y": {"scopes": ["mq.read", "mq.write"], "read_queues": ["ORDERS.STATUS"], "write_queues": ["ORDERS.REQUEST"]},
+    "intern.z":  {"scopes": ["mq.read"], "read_queues": ["ORDERS.STATUS"]}
+  }
+}
+```
+
+With entitlements on, an agent acting for no one, or for an unknown user, gets nothing.
+
+**Over HTTP, identity comes from OAuth.** The server is an OAuth 2.1 resource server, as in the MCP authorization specification. Register each agent with your identity provider (Entra ID, Okta, Ping, Keycloak) and run:
+
+```bash
+pip install -e ".[auth]"
+export MQ_TRANSPORT=streamable-http
+export MQ_AUTH_ISSUER=https://login.example.com/tenant-1
+export MQ_AUTH_AUDIENCE=https://mq-mcp.example.com          # this server; tokens must name it
+export MQ_AUTH_JWKS_URL=https://login.example.com/tenant-1/keys
+mcp-ibm-mq-server
+```
+
+Each request's bearer token is verified (signature against the JWKS, issuer, audience, expiry; `none` and HMAC algorithms are refused). The agent is `azp` / `client_id`, or the actor in an RFC 8693 `act` claim after a token exchange; the user is `sub`; scopes come from `scope` / `scp`. Ask your identity provider for short-lived tokens, and exchange the user's token for one scoped to this server rather than forwarding it.
+
 ## Release gate
 
 Every pull request runs an eval gate (`.github/workflows/ci.yml`, job `eval-gate`). A change does not merge if any score drops below its floor in [`evals/thresholds.yaml`](evals/thresholds.yaml).
 
 | Layer | What it checks | Needs |
 | --- | --- | --- |
-| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 44 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, 18 attack cases (planted instructions, queue-name smuggling, case and whitespace tricks, admin queue, draining, forged or reused approvals, a body swapped after approval, self-approval) are refused. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
+| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 65 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, and 31 attack cases are refused: planted instructions, queue-name smuggling, admin queue, draining, forged or reused approvals, a body swapped after approval, self-approval, agent and user rights combined as a union, and tokens that are unsigned, forged, expired, for another server or issuer, or use algorithm confusion. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
 | Agent ([`run_agent_evals.py`](evals/run_agent_evals.py)) | Claude drives the tools for 10 prompts in [`agent_cases.yaml`](evals/agent_cases.yaml): right tool and queue, and no obeying instructions planted in message bodies | `ANTHROPIC_API_KEY` repository secret; skipped without it |
 
 Run it locally:
@@ -160,11 +200,11 @@ python evals/run_evals.py                              # deterministic gate
 ANTHROPIC_API_KEY=... python evals/run_agent_evals.py  # agent evals
 ```
 
-The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only, approvals that skip the body check or never expire) and checks that the gate blocks it.
+The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only, approvals that skip the body check or never expire, agent-only scope checks, tokens accepted for any audience) and checks that the gate blocks it.
 
 ## Roadmap
 
-- Streamable HTTP transport with OAuth (MCP authorization spec)
+- Traces for every agent call, correlated across hops (newsletter issue 5)
 - JSON-schema validation of message bodies per queue
 - IBM MQ REST API client option (no native client libraries)
 
