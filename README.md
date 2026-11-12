@@ -6,7 +6,10 @@
 
 Most AI agent demos connect straight to core systems with a service account. That never gets past security in a bank, a hospital or a government agency. This server puts a narrow, audited tool layer between the agent and IBM MQ, so Claude, Copilot, OpenAI or Gemini agents can work with existing queues while the queue manager, its channels and the core systems stay unchanged.
 
-It is the reference implementation for issue #1 of my newsletter, [*Integration to Intelligence*](https://www.linkedin.com/in/aashish-malaviya): *"Your AI agent shouldn't touch your core systems directly."*
+It is the reference implementation for my newsletter, [*Integration to Intelligence*](https://www.linkedin.com/in/aashish-malaviya):
+
+- Issue 1, *"Your AI agent shouldn't touch your core systems directly"*: the governed tool layer (v0.1.0)
+- Issue 2, *"Your AI agent needs a release gate, not a demo"*: the eval gate in CI (v0.2.0, [below](#release-gate))
 
 ## Why this design
 
@@ -114,11 +117,30 @@ pip install -e ".[dev]" && pytest
 
 Tests use the in-memory client, so they run anywhere, including CI.
 
+## Release gate
+
+Every pull request runs an eval gate (`.github/workflows/ci.yml`, job `eval-gate`). A change does not merge if any score drops below its floor in [`evals/thresholds.yaml`](evals/thresholds.yaml).
+
+| Layer | What it checks | Needs |
+| --- | --- | --- |
+| Deterministic ([`run_evals.py`](evals/run_evals.py)) | 30 cases in [`cases.yaml`](evals/cases.yaml): allowed actions work, forbidden ones are refused, 12 attack cases (planted instructions, queue-name smuggling, case and whitespace tricks, admin queue, draining) are refused. On every case: an audit line exists, no sensitive text reaches the audit log, and a refused call changes nothing on any queue | Nothing; runs free on every PR |
+| Agent ([`run_agent_evals.py`](evals/run_agent_evals.py)) | Claude drives the tools for 10 prompts in [`agent_cases.yaml`](evals/agent_cases.yaml): right tool and queue, and no obeying instructions planted in message bodies | `ANTHROPIC_API_KEY` repository secret; skipped without it |
+
+Run it locally:
+
+```bash
+pip install -e ".[evals]"
+python evals/run_evals.py                              # deterministic gate
+ANTHROPIC_API_KEY=... python evals/run_agent_evals.py  # agent evals
+```
+
+The gate is itself tested: `tests/test_evals.py` weakens the policy on purpose (prefix matching on queue names, ignoring read-only) and checks that the gate blocks it.
+
 ## Roadmap
 
 - Streamable HTTP transport with OAuth (MCP authorization spec)
 - JSON-schema validation of message bodies per queue
-- Approval hook for writes above a risk threshold
+- Approval hook for writes above a risk threshold (newsletter issue 3: where the human belongs)
 - IBM MQ REST API client option (no native client libraries)
 
 ## About

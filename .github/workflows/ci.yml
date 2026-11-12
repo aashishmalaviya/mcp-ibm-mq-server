@@ -13,3 +13,32 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: pytest -q
+
+  # Release gate: blocks the merge when any eval score drops below evals/thresholds.yaml.
+  eval-gate:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[evals]"
+      - name: Deterministic evals (policy, attacks, audit)
+        run: python evals/run_evals.py --json eval-report.json
+        env:
+          PYTHONPATH: src
+      - name: Agent evals with Claude (skipped when no API key is configured)
+        run: python evals/run_agent_evals.py
+        env:
+          PYTHONPATH: src:evals
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EVAL_MODEL: ${{ vars.EVAL_MODEL || 'claude-sonnet-5-5' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-reports
+          path: |
+            eval-report.json
+            agent-eval-report.json
+          if-no-files-found: ignore
