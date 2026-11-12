@@ -8,7 +8,7 @@ A governed MCP server that lets AI agents work with IBM MQ without bypassing ent
 
 ## Layout
 
-- `src/mcp_ibm_mq/`: `server.py` (MCP wiring), `service.py` (tool logic), `policy.py` (deny-by-default rules), `audit.py` (JSON audit lines, payload digests only), `mq_client.py` (pymqi client and in-memory fake). Later releases add `approvals.py` and `approve_cli.py` (v0.3.0) `identity.py` and `auth.py` (v0.4.0), and `tracing.py` and `trace_cli.py` (v0.5.0).
+- `src/mcp_ibm_mq/`: `server.py` (MCP wiring), `service.py` (tool logic), `policy.py` (deny-by-default rules), `audit.py` (JSON audit lines, payload digests only), `mq_client.py` (pymqi client and in-memory fake). Later releases add `approvals.py` and `approve_cli.py` (v0.3.0), `identity.py` and `auth.py` (v0.4.0), and `tracing.py` and `trace_cli.py` (v0.5.0).
 - `evals/`: the release gate. `cases.yaml` (deterministic cases), `run_evals.py`, `agent_cases.yaml` and `run_agent_evals.py` (Claude drives the tools; needs `ANTHROPIC_API_KEY`), `thresholds.yaml` (score floors).
 - `tests/`: pytest, all against the in-memory client. `tests/test_evals.py` weakens the code on purpose and asserts the gate blocks it.
 
