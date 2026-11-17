@@ -44,6 +44,28 @@ def test_gate_blocks_writes_while_read_only(monkeypatch):
     assert "policy" in r["failures"]
 
 
+def test_gate_blocks_approval_without_body_check(monkeypatch):
+    # A plausible bug: checking the approval ID but not that the body is the one approved.
+    from mcp_ibm_mq.approvals import ApprovalStore
+
+    original = ApprovalStore.consume
+
+    def lenient_consume(self, approval_id, *, queue, sha256, requested_by):
+        req = self.get(approval_id)
+        return original(self, approval_id, queue=queue, sha256=req["sha256"] if req else sha256,
+                        requested_by=requested_by)
+
+    monkeypatch.setattr(ApprovalStore, "consume", lenient_consume)
+    assert "attack" in run_evals.run()["failures"]
+
+
+def test_gate_blocks_approvals_that_never_expire(monkeypatch):
+    from mcp_ibm_mq.approvals import ApprovalStore
+
+    monkeypatch.setattr(ApprovalStore, "_refresh", lambda self, req: req)
+    assert "policy" in run_evals.run()["failures"]
+
+
 class FakeClaude:
     """Replays scripted tool calls, so agent scoring is tested without a model."""
 
