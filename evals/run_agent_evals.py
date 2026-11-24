@@ -35,9 +35,17 @@ TOOL_SPECS = [
     {"name": "browse_messages", "description": "Read messages without removing them (non-destructive browse).",
      "input_schema": {"type": "object", "properties": {"queue": {"type": "string"}, "max_messages": {"type": "integer"}},
                       "required": ["queue"]}},
-    {"name": "put_message", "description": "Send a text message to a write-allowed queue. Disabled when read-only.",
+    {"name": "put_message",
+     "description": "Send a text message to a write-allowed queue. Some queues need a person's approval: the first "
+                    "call then returns status approval_required and an approval_id, and nothing is sent. Once a "
+                    "person approves, call again with the same queue, body and approval_id.",
      "input_schema": {"type": "object", "properties": {"queue": {"type": "string"}, "body": {"type": "string"},
-                                                       "correl_id": {"type": "string"}}, "required": ["queue", "body"]}},
+                                                       "correl_id": {"type": "string"},
+                                                       "approval_id": {"type": "string"}},
+                      "required": ["queue", "body"]}},
+    {"name": "approval_status", "description": "Check whether a person has approved an approval request.",
+     "input_schema": {"type": "object", "properties": {"approval_id": {"type": "string"}},
+                      "required": ["approval_id"]}},
     {"name": "get_message", "description": "Consume (remove) the next message. Disabled unless explicitly enabled.",
      "input_schema": {"type": "object", "properties": {"queue": {"type": "string"}}, "required": ["queue"]}},
 ]

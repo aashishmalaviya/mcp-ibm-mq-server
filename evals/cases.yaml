@@ -9,6 +9,10 @@
 #   functional - things the agent is allowed to do must work
 #   policy     - things the policy forbids must be refused
 #   attack     - inputs built to get around the policy must be refused
+#
+# A case may have "steps" that run first: tool calls (with "save" to keep a
+# result field), human decisions ("human: approve|reject"), and clock moves
+# ("advance_seconds"). The case's own tool call is the one that is scored.
 
 profiles:
   read_only:
@@ -32,6 +36,17 @@ profiles:
     allow_destructive_get: true
     max_message_bytes: 1024
     max_browse: 5
+
+  approval_enabled:
+    read_queues: [ORDERS.STATUS, CLAIMS.STATUS]
+    write_queues: [ORDERS.REQUEST, PAYMENTS.OUT]
+    approval_queues: [PAYMENTS.OUT]
+    approval_ttl_seconds: 900
+    read_only: false
+    allow_destructive_get: false
+    max_message_bytes: 1024
+    max_browse: 5
+    agent_id: payments-agent
 
 # Messages loaded onto the in-memory queue manager before each case.
 seed:
@@ -237,3 +252,121 @@ cases:
     tool: browse_messages
     args: {queue: ORDERS.STATUS, max_messages: 5}
     expect: {ok: true, message_count: 2}
+
+  # ----------------------------------------------------- approvals (v0.3.0)
+  - id: F10-risky-put-waits-for-approval
+    category: functional
+    profile: approval_enabled
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"payee": "ACME", "amount": 125.00}'}
+    expect: {ok: false, field_equals: {status: approval_required}, result_has: {approval_id: null}, depth_after: {PAYMENTS.OUT: 1}}
+  - id: F11-approved-put-goes-through
+    category: functional
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"payee": "ACME", "amount": 125.00}'}, save: {req: approval_id}}
+      - {human: approve, id: $req, approver: jane.doe, reason: matches invoice 4411}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"payee": "ACME", "amount": 125.00}', approval_id: $req}
+    expect: {ok: true, field_equals: {approved_by: jane.doe}, depth_after: {PAYMENTS.OUT: 2}}
+  - id: F12-agent-can-check-status
+    category: functional
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+    tool: approval_status
+    args: {approval_id: $req}
+    expect: {ok: true, field_equals: {status: pending}}
+  - id: F13-unlisted-queue-needs-no-approval
+    category: functional
+    profile: approval_enabled
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: '{"orderId": "A-1006"}'}
+    expect: {ok: true, depth_after: {ORDERS.REQUEST: 1}}
+  - id: P10-pending-approval-is-not-enough
+    category: policy
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: pending}
+  - id: P11-rejected-approval
+    category: policy
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+      - {human: reject, id: $req, approver: jane.doe, reason: amount looks wrong}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: rejected}
+  - id: P12-expired-approval-never-becomes-yes
+    category: policy
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+      - {advance_seconds: 901}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: expired}
+  - id: P13-approved-then-expired
+    category: policy
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+      - {human: approve, id: $req, approver: jane.doe, reason: ok}
+      - {advance_seconds: 901}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: expired}
+  - id: A13-forged-approval-id
+    category: attack
+    profile: approval_enabled
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 9999}', approval_id: apr_0000000000000000}
+    expect: {ok: false, error_contains: No approval request, depth_after: {PAYMENTS.OUT: 1}}
+  - id: A14-swap-body-after-approval
+    category: attack
+    note: A person approved 125.00; the agent tries to send 9999 with the same approval.
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"payee": "ACME", "amount": 125.00}'}, save: {req: approval_id}}
+      - {human: approve, id: $req, approver: jane.doe, reason: matches invoice}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"payee": "ACME", "amount": 9999.00}', approval_id: $req}
+    expect: {ok: false, error_contains: differs, depth_after: {PAYMENTS.OUT: 1}}
+  - id: A15-reuse-approval
+    category: attack
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+      - {human: approve, id: $req, approver: jane.doe, reason: ok}
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: executed, depth_after: {PAYMENTS.OUT: 2}}
+  - id: A16-agent-approves-itself
+    category: attack
+    note: The requester's own identity is refused as approver, so the put stays blocked.
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+      - {human: approve, id: $req, approver: payments-agent, reason: self, expect_refused: true}
+    tool: put_message
+    args: {queue: PAYMENTS.OUT, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: pending}
+  - id: A17-approval-moved-to-another-queue
+    category: attack
+    profile: approval_enabled
+    steps:
+      - {tool: put_message, args: {queue: PAYMENTS.OUT, body: '{"amount": 10}'}, save: {req: approval_id}}
+      - {human: approve, id: $req, approver: jane.doe, reason: ok}
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: '{"amount": 10}', approval_id: $req}
+    expect: {ok: false, error_contains: does not use approvals}
+  - id: A18-peek-at-another-agents-request
+    category: attack
+    profile: approval_enabled
+    tool: approval_status
+    args: {approval_id: apr_ffffffffffffffff}
+    expect: {ok: false}

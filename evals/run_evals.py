@@ -22,13 +22,24 @@ from typing import Any
 
 import yaml
 
+from mcp_ibm_mq.approvals import ApprovalError, ApprovalStore
 from mcp_ibm_mq.audit import AuditLog
 from mcp_ibm_mq.mq_client import InMemoryClient
 from mcp_ibm_mq.policy import Policy
 from mcp_ibm_mq.service import MQService
 
 HERE = Path(__file__).resolve().parent
-TOOLS = {"list_queues", "queue_depth", "browse_messages", "put_message", "get_message"}
+TOOLS = {"list_queues", "queue_depth", "browse_messages", "put_message", "get_message", "approval_status"}
+
+
+class Clock:
+    """A clock the eval can move forward, to test approval expiry."""
+
+    def __init__(self) -> None:
+        self.now = 1_800_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 def load(name: str) -> dict[str, Any]:
@@ -43,21 +54,54 @@ def build(profile: dict[str, Any], seed: dict[str, list[str]]):
         allow_destructive_get=bool(profile.get("allow_destructive_get", False)),
         max_message_bytes=int(profile.get("max_message_bytes", 64 * 1024)),
         max_browse=int(profile.get("max_browse", 20)),
+        approval_queues=frozenset(profile.get("approval_queues", [])),
+        approval_ttl_seconds=int(profile.get("approval_ttl_seconds", 3600)),
     )
     queues = {q: [m.encode("utf-8") for m in (msgs or [])] for q, msgs in seed.items()}
     stream = io.StringIO()
-    service = MQService(InMemoryClient(queues), policy, AuditLog(path="", stream=stream))
+    audit = AuditLog(path="", stream=stream)
+    audit.actor = profile.get("agent_id", "eval-agent")
+    clock = Clock()
+    service = MQService(InMemoryClient(queues), policy, audit, ApprovalStore(clock=clock))
+    service.eval_clock = clock
     return service, stream
 
 
-def expand(args: dict[str, Any]) -> dict[str, Any]:
-    """Allow {repeat: "x", times: N} so large payloads stay readable in YAML."""
+def expand(args: dict[str, Any], saved: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Allow {repeat: "x", times: N} for large payloads, and "$name" for values saved by earlier steps."""
     out = {}
     for key, value in args.items():
         if isinstance(value, dict) and "repeat" in value:
             value = str(value["repeat"]) * int(value["times"])
+        elif isinstance(value, str) and value.startswith("$") and saved is not None:
+            value = saved.get(value[1:], value)
         out[key] = value
     return out
+
+
+def run_steps(service: MQService, case: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Run setup steps (tool calls, human decisions, clock moves). Returns saved values and problems."""
+    saved: dict[str, Any] = {}
+    problems: list[str] = []
+    for step in case.get("steps", []):
+        if "tool" in step:
+            result = getattr(service, step["tool"])(**expand(step.get("args", {}), saved))
+            for name, field in (step.get("save") or {}).items():
+                saved[name] = result.get(field)
+        elif "human" in step:
+            try:
+                service.approvals.decide(
+                    expand({"id": step["id"]}, saved)["id"], approver=step["approver"],
+                    approve=step["human"] == "approve", reason=step.get("reason", "eval"),
+                )
+                if step.get("expect_refused"):
+                    problems.append(f"human {step['human']} by {step['approver']} was allowed")
+            except ApprovalError as err:
+                if not step.get("expect_refused"):
+                    problems.append(f"human step refused: {err}")
+        elif "advance_seconds" in step:
+            service.eval_clock.now += float(step["advance_seconds"])
+    return saved, problems
 
 
 def depths(service: MQService, queues: list[str]) -> dict[str, int]:
@@ -68,6 +112,9 @@ def check(case: dict[str, Any], result: dict[str, Any], after: dict[str, int]) -
     exp, problems = case.get("expect", {}), []
     if result.get("ok") is not exp.get("ok"):
         problems.append(f"ok={result.get('ok')} expected {exp.get('ok')}")
+    for field, want in (exp.get("result_has") or {}).items():
+        if field not in result or (want is not None and result[field] != want):
+            problems.append(f"result missing {field}={want!r}")
     if "error_contains" in exp and exp["error_contains"] not in str(result.get("error", "")):
         problems.append(f"error does not mention '{exp['error_contains']}'")
     for field, want in (exp.get("field_equals") or {}).items():
@@ -98,14 +145,17 @@ def run() -> dict[str, Any]:
         if case["tool"] not in TOOLS:
             raise SystemExit(f"{case['id']}: unknown tool {case['tool']}")
         service, stream = build(spec["profiles"][case["profile"]], seed)
+        saved, step_problems = run_steps(service, case)
+        offset = len(stream.getvalue())
         before = depths(service, queues)
-        result = getattr(service, case["tool"])(**expand(case.get("args", {})))
+        result = getattr(service, case["tool"])(**expand(case.get("args", {}), saved))
         after = depths(service, queues)
-        log = stream.getvalue()
+        full_log = stream.getvalue()
+        log = full_log[offset:]
 
-        problems = check(case, result, after)
+        problems = step_problems + check(case, result, after)
         audited = any(json.loads(line).get("tool") == case["tool"] for line in log.splitlines())
-        leaked = [m for m in markers if m in log]
+        leaked = [m for m in markers if m in full_log]
         side_effect = (result.get("ok") is False) and before != after
 
         bump(case["category"], not problems)

@@ -11,6 +11,7 @@ import os
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
+from .approvals import ApprovalStore
 from .audit import AuditLog
 from .mq_client import InMemoryClient, PyMQIClient
 from .policy import Policy
@@ -24,7 +25,7 @@ def build_service() -> MQService:
         client = InMemoryClient(seed)
     else:
         client = PyMQIClient()
-    return MQService(client, policy, AuditLog())
+    return MQService(client, policy, AuditLog(), ApprovalStore.from_env())
 
 
 def create_server(service: MQService | None = None) -> MCPServer:
@@ -50,9 +51,22 @@ def create_server(service: MQService | None = None) -> MCPServer:
         return svc.browse_messages(queue, max_messages)
 
     @mcp.tool(annotations=write)
-    def put_message(queue: str, body: str, correl_id: str | None = None) -> dict:
-        """Send a text message to a write-allowed queue. Disabled when read-only."""
-        return svc.put_message(queue, body, correl_id)
+    def put_message(
+        queue: str, body: str, correl_id: str | None = None, approval_id: str | None = None
+    ) -> dict:
+        """Send a text message to a write-allowed queue. Disabled when read-only.
+
+        Some queues need a person's approval. For those, the first call returns
+        status "approval_required" and an approval_id; nothing is sent. Once a
+        person approves, call again with the same queue, the same body and that
+        approval_id. You cannot approve requests yourself.
+        """
+        return svc.put_message(queue, body, correl_id, approval_id)
+
+    @mcp.tool(annotations=read)
+    def approval_status(approval_id: str) -> dict:
+        """Check whether a person has approved, rejected or let expire an approval request."""
+        return svc.approval_status(approval_id)
 
     @mcp.tool(annotations=consume)
     def get_message(queue: str) -> dict:
