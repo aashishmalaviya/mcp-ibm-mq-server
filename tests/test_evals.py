@@ -66,6 +66,36 @@ def test_gate_blocks_approvals_that_never_expire(monkeypatch):
     assert "policy" in run_evals.run()["failures"]
 
 
+def test_gate_blocks_union_of_agent_and_user_rights(monkeypatch):
+    # A plausible bug: checking the agent's scopes but not the user's.
+    from dataclasses import replace
+
+    from mcp_ibm_mq.identity import TOOL_SCOPES, Entitlements
+
+    def agent_only(self, who, policy, tool):
+        if TOOL_SCOPES[tool] not in who.scopes:
+            raise PolicyError("lacks scope")
+        return replace(policy)
+
+    monkeypatch.setattr(Entitlements, "effective", agent_only)
+    failures = run_evals.run()["failures"]
+    assert "attack" in failures and "policy" in failures
+
+
+def test_gate_blocks_tokens_for_another_audience(monkeypatch):
+    import jwt
+
+    real_decode = jwt.decode
+
+    def no_audience(token, key, **kw):
+        kw.pop("audience", None)
+        kw["options"] = {**kw.get("options", {}), "verify_aud": False}
+        return real_decode(token, key, **kw)
+
+    monkeypatch.setattr(jwt, "decode", no_audience)
+    assert "attack" in run_evals.run()["failures"]
+
+
 class FakeClaude:
     """Replays scripted tool calls, so agent scoring is tested without a model."""
 

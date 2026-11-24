@@ -13,6 +13,8 @@
 # A case may have "steps" that run first: tool calls (with "save" to keep a
 # result field), human decisions ("human: approve|reject"), and clock moves
 # ("advance_seconds"). The case's own tool call is the one that is scored.
+#
+# token_cases check OAuth access-token verification (auth.py) directly.
 
 profiles:
   read_only:
@@ -47,6 +49,45 @@ profiles:
     max_message_bytes: 1024
     max_browse: 5
     agent_id: payments-agent
+
+  identity_read_agent:
+    read_queues: [ORDERS.STATUS, CLAIMS.STATUS]
+    write_queues: [ORDERS.REQUEST]
+    read_only: false
+    allow_destructive_get: true
+    identity: {agent_id: report-agent, user_id: analyst.y, scopes: [mq.read]}
+    entitlements:
+      users:
+        analyst.y: {scopes: [mq.read, mq.write, mq.consume], read_queues: [ORDERS.STATUS, CLAIMS.STATUS], write_queues: [ORDERS.REQUEST]}
+  identity_limited_user:
+    read_queues: [ORDERS.STATUS, CLAIMS.STATUS]
+    write_queues: [ORDERS.REQUEST]
+    read_only: false
+    allow_destructive_get: true
+    identity: {agent_id: ops-agent, user_id: intern.z, scopes: [mq.read, mq.write, mq.consume]}
+    entitlements:
+      users:
+        intern.z: {scopes: [mq.read], read_queues: [ORDERS.STATUS], write_queues: []}
+  identity_no_user:
+    read_queues: [ORDERS.STATUS]
+    read_only: true
+    identity: {agent_id: ops-agent, scopes: [mq.read]}
+    entitlements:
+      users:
+        analyst.y: {scopes: [mq.read], read_queues: [ORDERS.STATUS]}
+  identity_unknown_user:
+    read_queues: [ORDERS.STATUS]
+    read_only: true
+    identity: {agent_id: ops-agent, user_id: mallory, scopes: [mq.read]}
+    entitlements:
+      users:
+        analyst.y: {scopes: [mq.read], read_queues: [ORDERS.STATUS]}
+
+# OAuth settings for token cases: the runner signs test tokens with a key it
+# publishes in a JWKS, and with an attacker key it does not publish.
+token_settings:
+  issuer: https://login.example.com/tenant-1
+  audience: https://mq-mcp.example.com
 
 # Messages loaded onto the in-memory queue manager before each case.
 seed:
@@ -370,3 +411,109 @@ cases:
     tool: approval_status
     args: {approval_id: apr_ffffffffffffffff}
     expect: {ok: false}
+
+  # --------------------------------------------- identity and scopes (v0.4.0)
+  - id: F14-user-sees-only-their-queues
+    category: functional
+    profile: identity_limited_user
+    tool: list_queues
+    args: {}
+    expect: {ok: true, field_equals: {read: [ORDERS.STATUS], write: [], agent: ops-agent, on_behalf_of: intern.z}}
+  - id: F15-audit-names-agent-and-user
+    category: functional
+    profile: identity_limited_user
+    tool: browse_messages
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: true, audit_has: {actor: ops-agent, on_behalf_of: intern.z, scope: mq.read}}
+  - id: P14-agent-without-write-scope
+    category: policy
+    profile: identity_read_agent
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: hello}
+    expect: {ok: false, error_contains: "lacks scope 'mq.write'", audit_has: {actor: report-agent, on_behalf_of: analyst.y, outcome: denied}}
+  - id: P15-user-not-entitled-to-queue
+    category: policy
+    profile: identity_limited_user
+    tool: browse_messages
+    args: {queue: CLAIMS.STATUS}
+    expect: {ok: false, error_contains: allow-list}
+  - id: P16-user-without-write-scope
+    category: policy
+    profile: identity_limited_user
+    tool: put_message
+    args: {queue: ORDERS.REQUEST, body: hello}
+    expect: {ok: false, error_contains: "User 'intern.z' lacks scope", depth_after: {ORDERS.REQUEST: 0}}
+  - id: A19-agent-acts-for-no-one
+    category: attack
+    profile: identity_no_user
+    tool: browse_messages
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: false, error_contains: on behalf of a user}
+  - id: A20-unknown-user
+    category: attack
+    profile: identity_unknown_user
+    tool: queue_depth
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: false, error_contains: no entitlements}
+  - id: A21-union-is-never-granted
+    category: attack
+    note: The agent may consume and the server allows it, but the user may only read.
+    profile: identity_limited_user
+    tool: get_message
+    args: {queue: ORDERS.STATUS}
+    expect: {ok: false, error_contains: lacks scope, depth_after: {ORDERS.STATUS: 2}}
+
+token_cases:
+  - id: T01-valid-delegated-token
+    category: functional
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: "mq.read mq.write"}}
+    expect: {valid: true, agent: claims-agent, user: analyst.y, scopes: [mq.read, mq.write]}
+  - id: T02-token-exchange-actor
+    category: functional
+    token: {claims: {sub: analyst.y, act: {sub: claims-agent}, client_id: gateway, scope: mq.read}}
+    expect: {valid: true, agent: claims-agent, user: analyst.y, scopes: [mq.read]}
+  - id: T03-client-credentials-has-no-user
+    category: functional
+    token: {claims: {sub: batch-agent, client_id: batch-agent, scp: [mq.read]}}
+    expect: {valid: true, agent: batch-agent, user: null, scopes: [mq.read]}
+  - id: T04-unknown-scopes-are-dropped
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: "mq.read admin mq:* root"}}
+    expect: {valid: true, scopes: [mq.read]}
+  - id: T05-token-for-another-server
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, aud: https://payments-api.example.com, scope: mq.write}}
+    expect: {valid: false}
+  - id: T06-token-from-another-issuer
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, iss: https://evil.example.net, scope: mq.write}}
+    expect: {valid: false}
+  - id: T07-expired-token
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: mq.read}, exp_in: -120}
+    expect: {valid: false}
+  - id: T08-not-yet-valid
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: mq.read}, nbf_in: 600}
+    expect: {valid: false}
+  - id: T09-unsigned-token
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: "mq.read mq.write mq.consume"}, sign: none}
+    expect: {valid: false}
+  - id: T10-forged-signature-with-trusted-kid
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: mq.write}, sign: attacker}
+    expect: {valid: false}
+  - id: T11-algorithm-confusion
+    category: attack
+    note: HS256 keyed with the published public key, a classic JWT bypass.
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: mq.write}, sign: hs256-public-key}
+    expect: {valid: false}
+  - id: T12-missing-subject
+    category: attack
+    token: {claims: {azp: claims-agent, scope: mq.read}, drop: [sub]}
+    expect: {valid: false}
+  - id: T13-missing-expiry
+    category: attack
+    token: {claims: {sub: analyst.y, azp: claims-agent, scope: mq.read}, drop: [exp]}
+    expect: {valid: false}

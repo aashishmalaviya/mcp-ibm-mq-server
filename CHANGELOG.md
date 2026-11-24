@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.0: agent identity, OAuth and least privilege
+
+Companion to *Integration to Intelligence* issue 4, "Your AI agent needs an identity, not a service account".
+
+- Every call resolves a named agent and the user it acts for; both go into the audit log with the scope used
+- Per-tool scopes (`mq.read`, `mq.write`, `mq.consume`) and optional user entitlements (`MQ_ENTITLEMENTS`); effective access is the intersection of server policy, agent grant and user grant
+- Streamable HTTP transport with OAuth 2.1 bearer tokens (`MQ_TRANSPORT=streamable-http`): JWKS signature, issuer, audience and expiry checks; agent from `azp` / `client_id` / RFC 8693 `act`, user from `sub`
+- 21 new eval cases (65 in total), including 13 token attacks (unsigned, forged, expired, wrong audience or issuer, algorithm confusion); gate tests for a union of rights and for skipping the audience check
+- Defaults unchanged for stdio: without `MQ_AGENT_SCOPES` or `MQ_ENTITLEMENTS` the server behaves as in v0.3.0
+
 ## v0.3.0: human approval for risky writes
 
 Companion to *Integration to Intelligence* issue 3, "Where the human belongs in an AI agent workflow (and where they don't)".

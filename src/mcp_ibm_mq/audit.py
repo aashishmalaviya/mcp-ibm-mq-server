@@ -25,11 +25,11 @@ class AuditLog:
     def digest(body: bytes) -> str:
         return hashlib.sha256(body).hexdigest()
 
-    def record(self, tool: str, outcome: str, **fields: Any) -> dict[str, Any]:
+    def record(self, tool: str, outcome: str, actor: str | None = None, **fields: Any) -> dict[str, Any]:
         entry = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "audit_id": uuid.uuid4().hex,
-            "actor": self.actor,
+            "actor": actor or self.actor,
             "tool": tool,
             "outcome": outcome,
             **fields,
